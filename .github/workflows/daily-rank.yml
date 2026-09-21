@@ -1,0 +1,38 @@
+name: Daily stock ranking refresh
+
+on:
+  schedule:
+    # 11:00 UTC = 6:00 AM EST / 7:00 AM EDT — comfortably before the 9:30 AM ET
+    # market open year-round. Adjust the cron if you're in a different timezone
+    # or want a different lead time. Mon-Fri only (market days).
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ranking script
+        run: python rank_stocks.py
+
+      - name: Commit and push updated dashboard
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --quiet --cached || git commit -m "Daily refresh: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
