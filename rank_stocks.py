@@ -274,16 +274,23 @@ def table_rows(df: pd.DataFrame, columns: list) -> str:
 
 def render_table(title: str, description: str, df: pd.DataFrame, col_defs: list) -> str:
     if df is None or df.empty:
-        body = "<p class='empty'>No stocks currently qualify for this screen.</p>"
+        body = "<p class='empty' data-empty-msg>No stocks currently qualify for this screen.</p>"
     else:
         headers = "".join(f"<th>{c[0]}</th>" for c in col_defs)
         rows = []
         for _, r in df.iterrows():
             cells = "".join(f"<td>{c[1](r)}</td>" for c in col_defs)
-            rows.append(f"<tr>{cells}</tr>")
-        body = f"<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+            # data-search carries a lowercase "TICKER name" string used by the
+            # search bar's client-side filter — kept off-screen, not rendered.
+            search_key = f"{r['symbol']} {r['name']}".lower()
+            rows.append(f'<tr data-search="{search_key}">{cells}</tr>')
+        body = (
+            f"<div class='tablewrap'><table><thead><tr>{headers}</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+            f"<p class='empty no-results' hidden>No matches in this section.</p>"
+        )
     return f"""
-    <section class="card">
+    <section class="card" data-section>
       <h2>{title}</h2>
       <p class="desc">{description}</p>
       {body}
@@ -401,18 +408,75 @@ def build_html(cats: dict, generated_at: str) -> str:
   .empty {{ color: var(--muted); font-style: italic; }}
   footer {{ color: var(--muted); font-size: 0.78rem; text-align: center; margin-top: 40px; }}
   .tablewrap {{ overflow-x: auto; }}
+  .searchbar {{
+    position: sticky; top: 0; z-index: 5; background: var(--bg);
+    padding: 10px 0 16px;
+  }}
+  .searchbar input {{
+    width: 100%; padding: 12px 14px; border-radius: 10px; font-size: 1rem;
+    border: 1px solid #ffffff22; background: var(--card); color: var(--text);
+  }}
+  .searchbar input:focus {{ outline: 2px solid var(--accent); }}
+  .searchbar .hint {{ color: var(--muted); font-size: 0.78rem; margin: 6px 2px 0; }}
+  section[data-section][hidden] {{ display: none; }}
 </style>
 </head>
 <body>
   <div class="wrap">
     <h1>My Wall Street Favorites</h1>
     <p class="subtitle">Personal replica &middot; auto-refreshed daily before market open &middot; last updated {generated_at}</p>
+    <div class="searchbar">
+      <input type="text" id="stockSearch" placeholder="Search by ticker or company name (e.g. AAPL, Apple)..." autocomplete="off" />
+      <p class="hint" id="searchHint"></p>
+    </div>
     {sections}
     <footer>
       Data via Yahoo Finance (yfinance). Not investment advice &mdash; for personal research only.
       Universe: {len(TICKERS)} large-cap tickers, market cap &ge; ${int(MIN_MARKET_CAP/1e9)}B, &ge;{MIN_ANALYSTS} analysts.
     </footer>
   </div>
+  <script>
+    (function () {{
+      const input = document.getElementById('stockSearch');
+      const hint = document.getElementById('searchHint');
+      const sections = Array.from(document.querySelectorAll('section[data-section]'));
+
+      function applyFilter() {{
+        const q = input.value.trim().toLowerCase();
+        let totalMatches = 0;
+
+        sections.forEach(function (section) {{
+          const rows = Array.from(section.querySelectorAll('tbody tr'));
+          let sectionMatches = 0;
+
+          rows.forEach(function (row) {{
+            const key = row.getAttribute('data-search') || '';
+            const match = q === '' || key.indexOf(q) !== -1;
+            row.hidden = !match;
+            if (match) sectionMatches++;
+          }});
+
+          totalMatches += sectionMatches;
+
+          const noResults = section.querySelector('.no-results');
+          const hasRows = rows.length > 0;
+          if (noResults) {{
+            noResults.hidden = !(q !== '' && hasRows && sectionMatches === 0);
+          }}
+          // Hide the whole section only when it has real rows but none match.
+          section.hidden = q !== '' && hasRows && sectionMatches === 0;
+        }});
+
+        hint.textContent = q === ''
+          ? ''
+          : (totalMatches === 0
+              ? 'No stocks match "' + input.value.trim() + '" in this dashboard.'
+              : totalMatches + ' match' + (totalMatches === 1 ? '' : 'es') + ' across all sections.');
+      }}
+
+      input.addEventListener('input', applyFilter);
+    }})();
+  </script>
 </body>
 </html>
 """
