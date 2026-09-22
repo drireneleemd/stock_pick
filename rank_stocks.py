@@ -144,6 +144,18 @@ def buyback_yield(ticker: yf.Ticker, market_cap: float) -> float:
     return np.nan
 
 
+def price_vs_moving_average(hist: pd.DataFrame, window: int) -> float:
+    """Current price as a percentage above/below its N-day simple moving
+    average, e.g. 0.08 means price is 8% above the MA."""
+    close = hist["Close"].dropna()
+    if len(close) < window:
+        return np.nan
+    ma = close.rolling(window).mean().iloc[-1]
+    if pd.isna(ma) or ma == 0:
+        return np.nan
+    return close.iloc[-1] / ma - 1.0
+
+
 def fetch_one(symbol: str) -> dict:
     t = yf.Ticker(symbol)
     info = t.info or {}
@@ -158,6 +170,7 @@ def fetch_one(symbol: str) -> dict:
     payout_ratio = safe_get(info, "payoutRatio")
     sector = safe_get(info, "sector", "Unknown")
     name = safe_get(info, "shortName", symbol)
+    forward_pe = safe_get(info, "forwardPE")
 
     upside = (target_mean / price - 1.0) if (target_mean and price) else np.nan
     dd = max_drawdown_from_high(hist)
@@ -165,6 +178,8 @@ def fetch_one(symbol: str) -> dict:
     stage = weinstein_stage(hist)
     bb_yield = buyback_yield(t, market_cap)
     div_streak = dividend_growth_streak(t.dividends)
+    vs_ma50 = price_vs_moving_average(hist, 50)
+    vs_ma200 = price_vs_moving_average(hist, 200)
 
     return {
         "symbol": symbol,
@@ -181,6 +196,9 @@ def fetch_one(symbol: str) -> dict:
         "buyback_yield": bb_yield,
         "dividend_streak_years": div_streak,
         "payout_ratio": payout_ratio,
+        "forward_pe": forward_pe,
+        "vs_ma50": vs_ma50,
+        "vs_ma200": vs_ma200,
     }
 
 
@@ -264,6 +282,17 @@ def fmt_int(x):
     return "-" if pd.isna(x) else f"{int(x)}"
 
 
+def fmt_ratio(x):
+    return "-" if pd.isna(x) else f"{x:.1f}x"
+
+
+def fmt_pct_signed(x):
+    if pd.isna(x):
+        return "-"
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x * 100:.1f}%"
+
+
 def table_rows(df: pd.DataFrame, columns: list) -> str:
     rows_html = []
     for _, r in df.iterrows():
@@ -305,6 +334,7 @@ def build_html(cats: dict, generated_at: str) -> str:
         ("Price", lambda r: fmt_price(r["price"])),
         ("Target", lambda r: fmt_price(r["target_mean"])),
         ("Upside", lambda r: fmt_pct(r["upside"])),
+        ("Fwd P/E", lambda r: fmt_ratio(r["forward_pe"])),
         ("Analysts", lambda r: fmt_int(r["num_analysts"])),
     ]
     steady_cols = upside_cols + [
@@ -323,6 +353,8 @@ def build_html(cats: dict, generated_at: str) -> str:
         ("Symbol", lambda r: f"<b>{r['symbol']}</b>"),
         ("Name", lambda r: r["name"]),
         ("Price", lambda r: fmt_price(r["price"])),
+        ("vs 50D MA", lambda r: fmt_pct_signed(r["vs_ma50"])),
+        ("vs 200D MA", lambda r: fmt_pct_signed(r["vs_ma200"])),
         ("6mo Return", lambda r: fmt_pct(r["return_6m"])),
         ("Sector", lambda r: r["sector"]),
     ]
