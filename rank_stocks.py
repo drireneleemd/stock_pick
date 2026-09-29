@@ -156,12 +156,59 @@ def price_vs_moving_average(hist: pd.DataFrame, window: int) -> float:
     return close.iloc[-1] / ma - 1.0
 
 
+def historical_avg_trailing_pe(ticker: yf.Ticker, full_hist: pd.DataFrame, years: int = 5) -> float:
+    """Approximate historical average trailing P/E: builds a trailing-12-month
+    EPS series from quarterly diluted EPS, matches it against the price on
+    each quarter-end date, and averages the resulting P/E over the window.
+    This is a trailing-PE average (forward PE isn't available historically),
+    used as a reasonable proxy for 'is this cheap/expensive vs its own history'."""
+    try:
+        q_inc = ticker.quarterly_income_stmt
+        if q_inc is None or q_inc.empty:
+            return np.nan
+        eps_row = None
+        for label in ("Diluted EPS", "Basic EPS"):
+            if label in q_inc.index:
+                eps_row = q_inc.loc[label]
+                break
+        if eps_row is None:
+            return np.nan
+        eps_row = eps_row.dropna().sort_index()
+        if len(eps_row) < 4:
+            return np.nan
+        ttm_eps = eps_row.rolling(4).sum().dropna()
+        if ttm_eps.empty:
+            return np.nan
+        cutoff = ttm_eps.index.max() - pd.DateOffset(years=years)
+        ttm_eps = ttm_eps[ttm_eps.index >= cutoff]
+        close = full_hist["Close"].dropna()
+        if close.empty:
+            return np.nan
+        pe_values = []
+        for as_of, eps_val in ttm_eps.items():
+            if eps_val is None or pd.isna(eps_val) or eps_val <= 0:
+                continue
+            pos = close.index.searchsorted(as_of, side="right") - 1
+            if pos < 0:
+                continue
+            price_at = close.iloc[pos]
+            pe_values.append(price_at / eps_val)
+        if not pe_values:
+            return np.nan
+        return float(np.mean(pe_values))
+    except Exception:
+        return np.nan
+
+
 def fetch_one(symbol: str) -> dict:
     t = yf.Ticker(symbol)
     info = t.info or {}
-    hist = t.history(period="2y", auto_adjust=True)
+    # Fetch 5y so we have enough history for the trailing-PE-vs-history
+    # comparison; drawdown/6mo-return/stage all window down from this as needed.
+    hist = t.history(period="5y", auto_adjust=True)
     if hist.empty:
         raise ValueError("no price history")
+    hist_1y = hist.tail(252)  # ~52 trading weeks, for a true 52-week-high drawdown
 
     price = safe_get(info, "currentPrice") or hist["Close"].iloc[-1]
     market_cap = safe_get(info, "marketCap")
@@ -173,13 +220,15 @@ def fetch_one(symbol: str) -> dict:
     forward_pe = safe_get(info, "forwardPE")
 
     upside = (target_mean / price - 1.0) if (target_mean and price) else np.nan
-    dd = max_drawdown_from_high(hist)
+    dd = max_drawdown_from_high(hist_1y)
     ret6m = six_month_return(hist)
     stage = weinstein_stage(hist)
     bb_yield = buyback_yield(t, market_cap)
     div_streak = dividend_growth_streak(t.dividends)
     vs_ma50 = price_vs_moving_average(hist, 50)
     vs_ma200 = price_vs_moving_average(hist, 200)
+    hist_avg_pe = historical_avg_trailing_pe(t, hist)
+    vs_hist_pe = (forward_pe / hist_avg_pe - 1.0) if (forward_pe and hist_avg_pe and hist_avg_pe > 0) else np.nan
 
     return {
         "symbol": symbol,
@@ -199,6 +248,8 @@ def fetch_one(symbol: str) -> dict:
         "forward_pe": forward_pe,
         "vs_ma50": vs_ma50,
         "vs_ma200": vs_ma200,
+        "hist_avg_pe": hist_avg_pe,
+        "vs_hist_pe": vs_hist_pe,
     }
 
 
@@ -213,6 +264,24 @@ def build_dataset() -> pd.DataFrame:
         if (i + 1) % 20 == 0:
             print(f"...{i + 1}/{len(TICKERS)} fetched")
     df = pd.DataFrame(rows)
+    df = add_sector_pe_benchmark(df)
+    return df
+
+
+def add_sector_pe_benchmark(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds each stock's forward P/E relative to the median forward P/E of
+    its sector, within this tracked universe (not the whole market)."""
+    if df.empty or "sector" not in df.columns:
+        df["sector_pe_median"] = np.nan
+        df["vs_sector_pe"] = np.nan
+        return df
+    df = df.copy()
+    df["sector_pe_median"] = df.groupby("sector")["forward_pe"].transform("median")
+    df["vs_sector_pe"] = np.where(
+        df["sector_pe_median"].notna() & (df["sector_pe_median"] > 0) & df["forward_pe"].notna(),
+        df["forward_pe"] / df["sector_pe_median"] - 1.0,
+        np.nan,
+    )
     return df
 
 
@@ -335,6 +404,8 @@ def build_html(cats: dict, generated_at: str) -> str:
         ("Target", lambda r: fmt_price(r["target_mean"])),
         ("Upside", lambda r: fmt_pct(r["upside"])),
         ("Fwd P/E", lambda r: fmt_ratio(r["forward_pe"])),
+        ("vs 5Y Avg PE", lambda r: fmt_pct_signed(r["vs_hist_pe"])),
+        ("vs Sector PE", lambda r: fmt_pct_signed(r["vs_sector_pe"])),
         ("Analysts", lambda r: fmt_int(r["num_analysts"])),
     ]
     steady_cols = upside_cols + [
@@ -465,6 +536,10 @@ def build_html(cats: dict, generated_at: str) -> str:
     <footer>
       Data via Yahoo Finance (yfinance). Not investment advice &mdash; for personal research only.
       Universe: {len(TICKERS)} large-cap tickers, market cap &ge; ${int(MIN_MARKET_CAP/1e9)}B, &ge;{MIN_ANALYSTS} analysts.
+      "vs 5Y Avg PE" compares current forward P/E to the stock's own ~5-year average
+      <em>trailing</em> P/E (forward P/E isn't available historically, so this is an approximation,
+      not a strict apples-to-apples comparison). "vs Sector PE" compares forward P/E to the median
+      forward P/E of same-sector stocks within this tracked universe only, not the full market.
     </footer>
   </div>
   <script>
