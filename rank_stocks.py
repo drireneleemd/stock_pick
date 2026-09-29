@@ -268,15 +268,66 @@ def build_dataset() -> pd.DataFrame:
     return df
 
 
+# Yahoo's info["sector"] strings -> yfinance Sector API keys.
+SECTOR_KEY_MAP = {
+    "Technology": "technology",
+    "Financial Services": "financial-services",
+    "Healthcare": "healthcare",
+    "Consumer Cyclical": "consumer-cyclical",
+    "Communication Services": "communication-services",
+    "Industrials": "industrials",
+    "Consumer Defensive": "consumer-defensive",
+    "Energy": "energy",
+    "Basic Materials": "basic-materials",
+    "Real Estate": "real-estate",
+    "Utilities": "utilities",
+}
+
+MAX_SECTOR_CONSTITUENTS = 25  # cap per sector to keep run time bounded
+
+
+def market_wide_sector_median_pe(sector_name: str, cache: dict) -> float:
+    """Median forward P/E across a sector's real top constituents (not just
+    our tracked list), via yfinance's Sector API. Cached per sector so we
+    only do this once even though many tickers share a sector."""
+    if sector_name in cache:
+        return cache[sector_name]
+
+    key = SECTOR_KEY_MAP.get(sector_name, sector_name.lower().replace(" ", "-"))
+    median_pe = np.nan
+    try:
+        sector_obj = yf.Sector(key)
+        top = sector_obj.top_companies
+        if top is not None and not top.empty:
+            symbols = list(top.index)[:MAX_SECTOR_CONSTITUENTS]
+            pes = []
+            for sym in symbols:
+                try:
+                    pe = yf.Ticker(sym).info.get("forwardPE")
+                    if pe and pe > 0:
+                        pes.append(pe)
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            if pes:
+                median_pe = float(np.median(pes))
+    except Exception as e:
+        print(f"[sector-pe skip] {sector_name} ({key}): {e}")
+
+    cache[sector_name] = median_pe
+    return median_pe
+
+
 def add_sector_pe_benchmark(df: pd.DataFrame) -> pd.DataFrame:
     """Adds each stock's forward P/E relative to the median forward P/E of
-    its sector, within this tracked universe (not the whole market)."""
+    real top constituents across its whole sector (not just our tracked list)."""
     if df.empty or "sector" not in df.columns:
         df["sector_pe_median"] = np.nan
         df["vs_sector_pe"] = np.nan
         return df
     df = df.copy()
-    df["sector_pe_median"] = df.groupby("sector")["forward_pe"].transform("median")
+    cache = {}
+    df["sector_pe_median"] = df["sector"].apply(lambda s: market_wide_sector_median_pe(s, cache))
     df["vs_sector_pe"] = np.where(
         df["sector_pe_median"].notna() & (df["sector_pe_median"] > 0) & df["forward_pe"].notna(),
         df["forward_pe"] / df["sector_pe_median"] - 1.0,
@@ -521,6 +572,23 @@ def build_html(cats: dict, generated_at: str) -> str:
   }}
   .searchbar input:focus {{ outline: 2px solid var(--accent); }}
   .searchbar .hint {{ color: var(--muted); font-size: 0.78rem; margin: 6px 2px 0; }}
+  .searchbar .liveBtn {{
+    display: none; margin-top: 8px; padding: 8px 14px; border-radius: 8px;
+    border: 1px solid var(--accent); background: transparent; color: var(--accent);
+    font-size: 0.85rem; cursor: pointer;
+  }}
+  .searchbar .liveBtn:hover {{ background: #4f8cff22; }}
+  .liveCard {{
+    display: none; margin: 10px 0 0; padding: 14px 16px; border-radius: 10px;
+    background: var(--card); border: 1px solid #ffffff20; font-size: 0.88rem;
+  }}
+  .liveCard .liveTitle {{ font-weight: 600; margin-bottom: 6px; }}
+  .liveCard .liveGrid {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 8px 16px; margin-top: 6px;
+  }}
+  .liveCard .liveGrid div span {{ display: block; color: var(--muted); font-size: 0.72rem; }}
+  .liveCard .liveNote {{ color: var(--muted); font-size: 0.72rem; margin-top: 10px; }}
   section[data-section][hidden] {{ display: none; }}
 </style>
 </head>
@@ -531,6 +599,8 @@ def build_html(cats: dict, generated_at: str) -> str:
     <div class="searchbar">
       <input type="text" id="stockSearch" placeholder="Search by ticker or company name (e.g. AAPL, Apple)..." autocomplete="off" />
       <p class="hint" id="searchHint"></p>
+      <button type="button" class="liveBtn" id="liveLookupBtn">Look up live &mdash; not on this dashboard</button>
+      <div class="liveCard" id="liveCard"></div>
     </div>
     {sections}
     <footer>
@@ -539,13 +609,17 @@ def build_html(cats: dict, generated_at: str) -> str:
       "vs 5Y Avg PE" compares current forward P/E to the stock's own ~5-year average
       <em>trailing</em> P/E (forward P/E isn't available historically, so this is an approximation,
       not a strict apples-to-apples comparison). "vs Sector PE" compares forward P/E to the median
-      forward P/E of same-sector stocks within this tracked universe only, not the full market.
+      forward P/E of real top constituents across that whole sector (via Yahoo's sector data),
+      not just the stocks tracked in this dashboard. The "Look up live" button fetches a lighter,
+      real-time snapshot for any ticker directly from your browser and isn't part of the daily-refreshed data above.
     </footer>
   </div>
   <script>
     (function () {{
       const input = document.getElementById('stockSearch');
       const hint = document.getElementById('searchHint');
+      const liveBtn = document.getElementById('liveLookupBtn');
+      const liveCard = document.getElementById('liveCard');
       const sections = Array.from(document.querySelectorAll('section[data-section]'));
 
       function applyFilter() {{
@@ -579,7 +653,92 @@ def build_html(cats: dict, generated_at: str) -> str:
           : (totalMatches === 0
               ? 'No stocks match "' + input.value.trim() + '" in this dashboard.'
               : totalMatches + ' match' + (totalMatches === 1 ? '' : 'es') + ' across all sections.');
+
+        // Offer a live lookup only when nothing in the dashboard matched and
+        // the query looks like it could plausibly be a ticker (letters/dot, short).
+        const looksLikeTicker = /^[A-Za-z.-]{{1,6}}$/.test(input.value.trim());
+        liveBtn.style.display = (q !== '' && totalMatches === 0 && looksLikeTicker) ? 'inline-block' : 'none';
+        if (q === '' || totalMatches > 0) {{
+          liveCard.style.display = 'none';
+        }}
       }}
+
+      async function fetchLiveQuote(symbol) {{
+        liveCard.style.display = 'block';
+        liveCard.innerHTML = '<div class="liveTitle">Looking up ' + symbol + '...</div>';
+
+        const target = 'https://query1.finance.yahoo.com/v10/finance/quoteSummary/' +
+          encodeURIComponent(symbol) + '?modules=price,summaryDetail,financialData,assetProfile';
+        const proxies = [
+          'https://corsproxy.io/?url=' + encodeURIComponent(target),
+          'https://api.allorigins.win/raw?url=' + encodeURIComponent(target)
+        ];
+
+        for (const proxyUrl of proxies) {{
+          try {{
+            const res = await fetch(proxyUrl);
+            if (!res.ok) continue;
+            const data = await res.json();
+            const result = data && data.quoteSummary && data.quoteSummary.result && data.quoteSummary.result[0];
+            if (!result) continue;
+
+            const price = result.price || {{}};
+            const summary = result.summaryDetail || {{}};
+            const fin = result.financialData || {{}};
+            const profile = result.assetProfile || {{}};
+
+            const raw = (obj) => (obj && typeof obj.raw === 'number') ? obj.raw : null;
+            const currentPrice = raw(price.regularMarketPrice) || raw(fin.currentPrice);
+            const targetMean = raw(fin.targetMeanPrice);
+            const forwardPE = raw(summaryDetailOrKeyStats(summary));
+            const ma50 = raw(summary.fiftyDayAverage);
+            const ma200 = raw(summary.twoHundredDayAverage);
+            const numAnalysts = raw(fin.numberOfAnalystOpinions);
+            const name = price.longName || price.shortName || symbol;
+            const sector = profile.sector || '-';
+
+            function fmtPrice(v) {{ return v == null ? '-' : '$' + v.toFixed(2); }}
+            function fmtPct(v) {{ return v == null ? '-' : (v * 100).toFixed(1) + '%'; }}
+            function fmtSignedPct(v) {{ return v == null ? '-' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%'; }}
+            function fmtRatio(v) {{ return v == null ? '-' : v.toFixed(1) + 'x'; }}
+
+            const upside = (currentPrice && targetMean) ? (targetMean / currentPrice - 1) : null;
+            const vsMa50 = (currentPrice && ma50) ? (currentPrice / ma50 - 1) : null;
+            const vsMa200 = (currentPrice && ma200) ? (currentPrice / ma200 - 1) : null;
+
+            liveCard.innerHTML =
+              '<div class="liveTitle">' + name + ' (' + symbol.toUpperCase() + ') &mdash; live lookup</div>' +
+              '<div class="liveGrid">' +
+                '<div><span>Price</span>' + fmtPrice(currentPrice) + '</div>' +
+                '<div><span>Analyst Target</span>' + fmtPrice(targetMean) + '</div>' +
+                '<div><span>Upside</span>' + fmtPct(upside) + '</div>' +
+                '<div><span>Fwd P/E</span>' + fmtRatio(forwardPE) + '</div>' +
+                '<div><span>vs 50D MA</span>' + fmtSignedPct(vsMa50) + '</div>' +
+                '<div><span>vs 200D MA</span>' + fmtSignedPct(vsMa200) + '</div>' +
+                '<div><span>Analysts</span>' + (numAnalysts == null ? '-' : numAnalysts) + '</div>' +
+                '<div><span>Sector</span>' + sector + '</div>' +
+              '</div>' +
+              '<p class="liveNote">Live snapshot only &mdash; skips buyback yield, dividend streak, ' +
+              'Weinstein stage, and 5yr/sector P/E comparisons (those need the daily batch run). ' +
+              'Fetched via a public CORS proxy, which can occasionally be slow or unavailable.</p>';
+            return;
+          }} catch (e) {{
+            continue;
+          }}
+        }}
+        liveCard.innerHTML = '<div class="liveTitle">Couldn\\'t fetch live data for ' + symbol +
+          '.</div><p class="liveNote">Double-check the ticker symbol, or try again in a moment ' +
+          '&mdash; the free lookup service this uses can be temporarily unavailable.</p>';
+      }}
+
+      function summaryDetailOrKeyStats(summary) {{
+        return summary.forwardPE || null;
+      }}
+
+      liveBtn.addEventListener('click', function () {{
+        const symbol = input.value.trim().toUpperCase();
+        if (symbol) fetchLiveQuote(symbol);
+      }});
 
       input.addEventListener('input', applyFilter);
     }})();
