@@ -139,8 +139,8 @@ def buyback_yield(ticker: yf.Ticker, market_cap: float) -> float:
                 if pd.isna(trailing) or market_cap in (None, 0) or pd.isna(market_cap):
                     return np.nan
                 return abs(trailing) / market_cap  # outflow is negative in statements
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[buyback skip] {getattr(ticker, 'ticker', '?')}: {type(e).__name__}: {e}")
     return np.nan
 
 
@@ -156,39 +156,47 @@ def price_vs_moving_average(hist: pd.DataFrame, window: int) -> float:
     return close.iloc[-1] / ma - 1.0
 
 
-def historical_avg_trailing_pe(ticker: yf.Ticker, full_hist: pd.DataFrame, years: int = 5) -> float:
-    """Approximate historical average trailing P/E: builds a trailing-12-month
-    EPS series from quarterly diluted EPS, matches it against the price on
-    each quarter-end date, and averages the resulting P/E over the window.
+def historical_avg_trailing_pe(ticker: yf.Ticker, full_hist: pd.DataFrame) -> float:
+    """Approximate historical average trailing P/E: matches each fiscal
+    year's diluted EPS against the price on that fiscal year-end date, and
+    averages the resulting P/E. Uses ANNUAL statements (Yahoo provides up to
+    ~4 years via yfinance) rather than quarterly, since Yahoo's quarterly
+    fundamentals-timeseries endpoint only ever returns ~5 quarters regardless
+    of the requested range -- nowhere near enough for a multi-year average.
     This is a trailing-PE average (forward PE isn't available historically),
     used as a reasonable proxy for 'is this cheap/expensive vs its own history'."""
     try:
-        q_inc = ticker.quarterly_income_stmt
-        if q_inc is None or q_inc.empty:
+        inc = ticker.income_stmt  # annual, pretty-formatted row labels
+        if inc is None or inc.empty:
             return np.nan
         eps_row = None
         for label in ("Diluted EPS", "Basic EPS"):
-            if label in q_inc.index:
-                eps_row = q_inc.loc[label]
+            if label in inc.index:
+                eps_row = inc.loc[label]
                 break
         if eps_row is None:
             return np.nan
-        eps_row = eps_row.dropna().sort_index()
-        if len(eps_row) < 4:
+        eps_row = eps_row.dropna()
+        if eps_row.empty:
             return np.nan
-        ttm_eps = eps_row.rolling(4).sum().dropna()
-        if ttm_eps.empty:
-            return np.nan
-        cutoff = ttm_eps.index.max() - pd.DateOffset(years=years)
-        ttm_eps = ttm_eps[ttm_eps.index >= cutoff]
+
         close = full_hist["Close"].dropna()
         if close.empty:
             return np.nan
+        # t.history()'s index is timezone-aware; income-statement dates are
+        # timezone-naive. Comparing them directly raises, so normalize here.
+        if isinstance(close.index, pd.DatetimeIndex) and close.index.tz is not None:
+            close = close.copy()
+            close.index = close.index.tz_localize(None)
+
         pe_values = []
-        for as_of, eps_val in ttm_eps.items():
+        for as_of, eps_val in eps_row.items():
             if eps_val is None or pd.isna(eps_val) or eps_val <= 0:
                 continue
-            pos = close.index.searchsorted(as_of, side="right") - 1
+            as_of_naive = pd.Timestamp(as_of)
+            if as_of_naive.tzinfo is not None:
+                as_of_naive = as_of_naive.tz_localize(None)
+            pos = close.index.searchsorted(as_of_naive, side="right") - 1
             if pos < 0:
                 continue
             price_at = close.iloc[pos]
@@ -196,7 +204,8 @@ def historical_avg_trailing_pe(ticker: yf.Ticker, full_hist: pd.DataFrame, years
         if not pe_values:
             return np.nan
         return float(np.mean(pe_values))
-    except Exception:
+    except Exception as e:
+        print(f"[hist-pe skip] {getattr(ticker, 'ticker', '?')}: {type(e).__name__}: {e}")
         return np.nan
 
 
@@ -455,7 +464,7 @@ def build_html(cats: dict, generated_at: str) -> str:
         ("Target", lambda r: fmt_price(r["target_mean"])),
         ("Upside", lambda r: fmt_pct(r["upside"])),
         ("Fwd P/E", lambda r: fmt_ratio(r["forward_pe"])),
-        ("vs 5Y Avg PE", lambda r: fmt_pct_signed(r["vs_hist_pe"])),
+        ("vs 4Y Avg PE", lambda r: fmt_pct_signed(r["vs_hist_pe"])),
         ("vs Sector PE", lambda r: fmt_pct_signed(r["vs_sector_pe"])),
         ("Analysts", lambda r: fmt_int(r["num_analysts"])),
     ]
@@ -606,7 +615,7 @@ def build_html(cats: dict, generated_at: str) -> str:
     <footer>
       Data via Yahoo Finance (yfinance). Not investment advice &mdash; for personal research only.
       Universe: {len(TICKERS)} large-cap tickers, market cap &ge; ${int(MIN_MARKET_CAP/1e9)}B, &ge;{MIN_ANALYSTS} analysts.
-      "vs 5Y Avg PE" compares current forward P/E to the stock's own ~5-year average
+      "vs 4Y Avg PE" compares current forward P/E to the stock's own ~4-year average
       <em>trailing</em> P/E (forward P/E isn't available historically, so this is an approximation,
       not a strict apples-to-apples comparison). "vs Sector PE" compares forward P/E to the median
       forward P/E of real top constituents across that whole sector (via Yahoo's sector data),
@@ -719,7 +728,7 @@ def build_html(cats: dict, generated_at: str) -> str:
                 '<div><span>Sector</span>' + sector + '</div>' +
               '</div>' +
               '<p class="liveNote">Live snapshot only &mdash; skips buyback yield, dividend streak, ' +
-              'Weinstein stage, and 5yr/sector P/E comparisons (those need the daily batch run). ' +
+              'Weinstein stage, and 4yr/sector P/E comparisons (those need the daily batch run). ' +
               'Fetched via a public CORS proxy, which can occasionally be slow or unavailable.</p>';
             return;
           }} catch (e) {{
