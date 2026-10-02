@@ -572,7 +572,10 @@ def build_html(cats: dict, generated_at: str) -> str:
   .desc {{ color: var(--muted); font-size: 0.88rem; margin-bottom: 14px; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.86rem; }}
   th, td {{ text-align: left; padding: 7px 8px; border-bottom: 1px solid #ffffff10; white-space: nowrap; }}
-  th {{ color: var(--muted); font-weight: 600; }}
+  th {{ color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; }}
+  th:hover {{ color: var(--text); }}
+  th.sort-asc::after {{ content: " \\25B2"; font-size: 0.7em; }}
+  th.sort-desc::after {{ content: " \\25BC"; font-size: 0.7em; }}
   tbody tr:hover {{ background: #ffffff08; }}
   .empty {{ color: var(--muted); font-style: italic; }}
   footer {{ color: var(--muted); font-size: 0.78rem; text-align: center; margin-top: 40px; }}
@@ -649,6 +652,57 @@ def build_html(cats: dict, generated_at: str) -> str:
       }}
 
       input.addEventListener('input', applyFilter);
+
+      // ---- Column sorting: click any header to sort that table by it ----
+      function parseCellValue(text) {{
+        const raw = text.trim();
+        if (raw === '' || raw === '-') return NaN;
+        const cleaned = raw.replace(/[$,]/g, '');  // strip $ and thousands commas
+        return parseFloat(cleaned);  // naturally stops at %, x, " yrs", etc.
+      }}
+
+      function sortTableBy(table, colIndex, ascending) {{
+        const tbody = table.querySelector('tbody');
+        if (!tbody) return;
+        const rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.sort(function (a, b) {{
+          const aText = a.children[colIndex] ? a.children[colIndex].textContent : '';
+          const bText = b.children[colIndex] ? b.children[colIndex].textContent : '';
+          const aNum = parseCellValue(aText);
+          const bNum = parseCellValue(bText);
+          const aIsNum = !isNaN(aNum);
+          const bIsNum = !isNaN(bNum);
+
+          if (aIsNum && bIsNum) {{
+            return ascending ? aNum - bNum : bNum - aNum;
+          }}
+          if (aIsNum !== bIsNum) {{
+            // Missing/non-numeric values ('-') always sink to the bottom,
+            // regardless of sort direction, rather than flipping to the top on desc.
+            return aIsNum ? -1 : 1;
+          }}
+          const cmp = aText.trim().localeCompare(bText.trim());
+          return ascending ? cmp : -cmp;
+        }});
+        rows.forEach(function (r) {{ tbody.appendChild(r); }});
+      }}
+
+      document.querySelectorAll('section[data-section] table').forEach(function (table) {{
+        const headers = Array.from(table.querySelectorAll('thead th'));
+        headers.forEach(function (th) {{ th.dataset.label = th.textContent; }});
+
+        headers.forEach(function (th, colIndex) {{
+          th.addEventListener('click', function () {{
+            const nextDir = th.classList.contains('sort-asc') ? 'desc' : 'asc';
+            headers.forEach(function (h) {{
+              h.classList.remove('sort-asc', 'sort-desc');
+              h.textContent = h.dataset.label;
+            }});
+            th.classList.add(nextDir === 'asc' ? 'sort-asc' : 'sort-desc');
+            sortTableBy(table, colIndex, nextDir === 'asc');
+          }});
+        }});
+      }});
     }})();
   </script>
 </body>
