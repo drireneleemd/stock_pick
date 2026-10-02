@@ -111,11 +111,17 @@ def six_month_return(hist: pd.DataFrame) -> float:
 
 
 def dividend_growth_streak(divs: pd.Series) -> int:
-    """Count consecutive years (most recent first) with a higher total
-    annual dividend than the prior year."""
+    """Count consecutive FULL calendar years (most recent complete year first)
+    with a higher total annual dividend than the prior year. The current,
+    still-in-progress calendar year is excluded -- otherwise a stock that
+    raised its dividend this year would often look like it DIDN'T, simply
+    because this year's partial total (e.g. 3 of 4 quarterly payments so far)
+    is naturally smaller than last year's full-year total."""
     if divs is None or divs.empty:
         return 0
     annual = divs.groupby(divs.index.year).sum()
+    current_year = dt.datetime.utcnow().year
+    annual = annual[annual.index < current_year]  # drop the incomplete current year
     years = sorted(annual.index)
     if len(years) < 2:
         return 0
@@ -581,23 +587,6 @@ def build_html(cats: dict, generated_at: str) -> str:
   }}
   .searchbar input:focus {{ outline: 2px solid var(--accent); }}
   .searchbar .hint {{ color: var(--muted); font-size: 0.78rem; margin: 6px 2px 0; }}
-  .searchbar .liveBtn {{
-    display: none; margin-top: 8px; padding: 8px 14px; border-radius: 8px;
-    border: 1px solid var(--accent); background: transparent; color: var(--accent);
-    font-size: 0.85rem; cursor: pointer;
-  }}
-  .searchbar .liveBtn:hover {{ background: #4f8cff22; }}
-  .liveCard {{
-    display: none; margin: 10px 0 0; padding: 14px 16px; border-radius: 10px;
-    background: var(--card); border: 1px solid #ffffff20; font-size: 0.88rem;
-  }}
-  .liveCard .liveTitle {{ font-weight: 600; margin-bottom: 6px; }}
-  .liveCard .liveGrid {{
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-    gap: 8px 16px; margin-top: 6px;
-  }}
-  .liveCard .liveGrid div span {{ display: block; color: var(--muted); font-size: 0.72rem; }}
-  .liveCard .liveNote {{ color: var(--muted); font-size: 0.72rem; margin-top: 10px; }}
   section[data-section][hidden] {{ display: none; }}
 </style>
 </head>
@@ -608,8 +597,6 @@ def build_html(cats: dict, generated_at: str) -> str:
     <div class="searchbar">
       <input type="text" id="stockSearch" placeholder="Search by ticker or company name (e.g. AAPL, Apple)..." autocomplete="off" />
       <p class="hint" id="searchHint"></p>
-      <button type="button" class="liveBtn" id="liveLookupBtn">Look up live &mdash; not on this dashboard</button>
-      <div class="liveCard" id="liveCard"></div>
     </div>
     {sections}
     <footer>
@@ -619,16 +606,13 @@ def build_html(cats: dict, generated_at: str) -> str:
       <em>trailing</em> P/E (forward P/E isn't available historically, so this is an approximation,
       not a strict apples-to-apples comparison). "vs Sector PE" compares forward P/E to the median
       forward P/E of real top constituents across that whole sector (via Yahoo's sector data),
-      not just the stocks tracked in this dashboard. The "Look up live" button fetches a lighter,
-      real-time snapshot for any ticker directly from your browser and isn't part of the daily-refreshed data above.
+      not just the stocks tracked in this dashboard.
     </footer>
   </div>
   <script>
     (function () {{
       const input = document.getElementById('stockSearch');
       const hint = document.getElementById('searchHint');
-      const liveBtn = document.getElementById('liveLookupBtn');
-      const liveCard = document.getElementById('liveCard');
       const sections = Array.from(document.querySelectorAll('section[data-section]'));
 
       function applyFilter() {{
@@ -662,92 +646,7 @@ def build_html(cats: dict, generated_at: str) -> str:
           : (totalMatches === 0
               ? 'No stocks match "' + input.value.trim() + '" in this dashboard.'
               : totalMatches + ' match' + (totalMatches === 1 ? '' : 'es') + ' across all sections.');
-
-        // Offer a live lookup only when nothing in the dashboard matched and
-        // the query looks like it could plausibly be a ticker (letters/dot, short).
-        const looksLikeTicker = /^[A-Za-z.-]{{1,6}}$/.test(input.value.trim());
-        liveBtn.style.display = (q !== '' && totalMatches === 0 && looksLikeTicker) ? 'inline-block' : 'none';
-        if (q === '' || totalMatches > 0) {{
-          liveCard.style.display = 'none';
-        }}
       }}
-
-      async function fetchLiveQuote(symbol) {{
-        liveCard.style.display = 'block';
-        liveCard.innerHTML = '<div class="liveTitle">Looking up ' + symbol + '...</div>';
-
-        const target = 'https://query1.finance.yahoo.com/v10/finance/quoteSummary/' +
-          encodeURIComponent(symbol) + '?modules=price,summaryDetail,financialData,assetProfile';
-        const proxies = [
-          'https://corsproxy.io/?url=' + encodeURIComponent(target),
-          'https://api.allorigins.win/raw?url=' + encodeURIComponent(target)
-        ];
-
-        for (const proxyUrl of proxies) {{
-          try {{
-            const res = await fetch(proxyUrl);
-            if (!res.ok) continue;
-            const data = await res.json();
-            const result = data && data.quoteSummary && data.quoteSummary.result && data.quoteSummary.result[0];
-            if (!result) continue;
-
-            const price = result.price || {{}};
-            const summary = result.summaryDetail || {{}};
-            const fin = result.financialData || {{}};
-            const profile = result.assetProfile || {{}};
-
-            const raw = (obj) => (obj && typeof obj.raw === 'number') ? obj.raw : null;
-            const currentPrice = raw(price.regularMarketPrice) || raw(fin.currentPrice);
-            const targetMean = raw(fin.targetMeanPrice);
-            const forwardPE = raw(summaryDetailOrKeyStats(summary));
-            const ma50 = raw(summary.fiftyDayAverage);
-            const ma200 = raw(summary.twoHundredDayAverage);
-            const numAnalysts = raw(fin.numberOfAnalystOpinions);
-            const name = price.longName || price.shortName || symbol;
-            const sector = profile.sector || '-';
-
-            function fmtPrice(v) {{ return v == null ? '-' : '$' + v.toFixed(2); }}
-            function fmtPct(v) {{ return v == null ? '-' : (v * 100).toFixed(1) + '%'; }}
-            function fmtSignedPct(v) {{ return v == null ? '-' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%'; }}
-            function fmtRatio(v) {{ return v == null ? '-' : v.toFixed(1) + 'x'; }}
-
-            const upside = (currentPrice && targetMean) ? (targetMean / currentPrice - 1) : null;
-            const vsMa50 = (currentPrice && ma50) ? (currentPrice / ma50 - 1) : null;
-            const vsMa200 = (currentPrice && ma200) ? (currentPrice / ma200 - 1) : null;
-
-            liveCard.innerHTML =
-              '<div class="liveTitle">' + name + ' (' + symbol.toUpperCase() + ') &mdash; live lookup</div>' +
-              '<div class="liveGrid">' +
-                '<div><span>Price</span>' + fmtPrice(currentPrice) + '</div>' +
-                '<div><span>Analyst Target</span>' + fmtPrice(targetMean) + '</div>' +
-                '<div><span>Upside</span>' + fmtPct(upside) + '</div>' +
-                '<div><span>Fwd P/E</span>' + fmtRatio(forwardPE) + '</div>' +
-                '<div><span>vs 50D MA</span>' + fmtSignedPct(vsMa50) + '</div>' +
-                '<div><span>vs 200D MA</span>' + fmtSignedPct(vsMa200) + '</div>' +
-                '<div><span>Analysts</span>' + (numAnalysts == null ? '-' : numAnalysts) + '</div>' +
-                '<div><span>Sector</span>' + sector + '</div>' +
-              '</div>' +
-              '<p class="liveNote">Live snapshot only &mdash; skips buyback yield, dividend streak, ' +
-              'Weinstein stage, and 4yr/sector P/E comparisons (those need the daily batch run). ' +
-              'Fetched via a public CORS proxy, which can occasionally be slow or unavailable.</p>';
-            return;
-          }} catch (e) {{
-            continue;
-          }}
-        }}
-        liveCard.innerHTML = '<div class="liveTitle">Couldn\\'t fetch live data for ' + symbol +
-          '.</div><p class="liveNote">Double-check the ticker symbol, or try again in a moment ' +
-          '&mdash; the free lookup service this uses can be temporarily unavailable.</p>';
-      }}
-
-      function summaryDetailOrKeyStats(summary) {{
-        return summary.forwardPE || null;
-      }}
-
-      liveBtn.addEventListener('click', function () {{
-        const symbol = input.value.trim().toUpperCase();
-        if (symbol) fetchLiveQuote(symbol);
-      }});
 
       input.addEventListener('input', applyFilter);
     }})();
